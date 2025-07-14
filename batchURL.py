@@ -3,7 +3,7 @@ import io
 import time
 import base64
 import argparse
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 import threading
 import logging
 from queue import Queue
@@ -28,7 +28,7 @@ logging.basicConfig(
 class FirefoxRequestFilter(logging.Filter):
     def filter(self, record):
         msg = record.getMessage()
-        FILTER_WORD = [".firefox.", ".mozilla.", ".google.",".ico"]
+        FILTER_WORD = [".firefox.", ".mozilla.", ".google.",".ico",".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".otf"]
         if any(domain in msg.lower() for domain in FILTER_WORD):
             return False
         return True
@@ -49,6 +49,7 @@ from seleniumwire import webdriver
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
 from selenium.common.exceptions import WebDriverException, TimeoutException
 # === 配置 ===
+THREAD_MAX_LIMIT = 20
 TARGET_IMG_HIGHT = 200
 ROW_HEIGHT = 150
 PROJ_INDEX = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -88,18 +89,24 @@ def page_judge_ai(imgPath,token):
     return None
 
 
-def page_judge_local(url: str, html: str,title: str ,http_status: int) -> str:
-    #错误页 http状态码 ；title包含关键字或者html包含关键字且简单结构
-    #登录页 html包含login关键字，非简单结构
-    #欢迎页 html包含关键字
-    #正常系统
-    
-    html_lower = html.lower()
+def extract_visible_text_and_count(html):
     soup = BeautifulSoup(html, 'html.parser')
-    body_tags = soup.find_all(True)
-    tag_count = len(body_tags)
-    TAG_THRESHOLD = 30
+    #记录标签总数（原始 HTML）
+    tag_count = len(soup.find_all(True))
+    #删除特定标签
+    for tag in soup(['script', 'style', 'head', 'meta', 'noscript']):
+        tag.decompose()
+    #删除 HTML 注释
+    for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+        comment.extract()
+    #提取可见文本（清理后）
+    visible_text = soup.get_text(separator=' ', strip=True)
 
+    return str(soup).lower(), visible_text.lower(), tag_count
+
+def page_judge_local(url: str, html: str,title: str ,http_status: int) -> str:
+    html_lower, visible_text, tag_count = extract_visible_text_and_count(html)
+    TAG_THRESHOLD = 30
     KEYWORDS = {
         "welcome": ["tomcat", "nginx", "openresty"],
         "error": [
@@ -113,45 +120,47 @@ def page_judge_local(url: str, html: str,title: str ,http_status: int) -> str:
             "503", "service unavailable",
             
         ],
-        "login": ["login"],
+        "login": ["login","type=\"password\"","登录"],
         "ui_error": ["error"]
     }
 
-    if http_status is None:
-        http_status = 0
 
-    #错误页判断
+    #错误页 http status 4xx 5xx
     if http_status is not None and http_status >= 400:
         logging.info(f"http status code -> {http_status} : {url}")
         return TYPE_DEFINE["3"]["type"]
-    if tag_count < TAG_THRESHOLD:
-        for keyword in KEYWORDS["error"]:
-            if keyword in html_lower:
-                logging.info(f"命中关键词 -> {keyword} : 标签数 -> {tag_count} : {url} ")
-                return TYPE_DEFINE["3"]["type"]
-    #登录页判断
+    #登录页 命中关键词 and 结构复杂
+    for keyword in KEYWORDS["login"]:
+        if keyword in html_lower:
+            logging.info(f"命中关键词 -> {keyword} : 标签数 -> {tag_count} : {url} ")
+            return TYPE_DEFINE["2"]["type"]
     if tag_count >= TAG_THRESHOLD:
-        for keyword in KEYWORDS["login"]:
-            if keyword in html_lower:
-                logging.info(f"命中关键词 -> {keyword} : 标签数 -> {tag_count} : {url} ")
-                return TYPE_DEFINE["2"]["type"]
-
-    #欢迎页判断
-    for keyword in KEYWORDS["welcome"]:
-        if keyword in html_lower and "welcom" in title.lower():
-            logging.info(f"命中关键词 -> {keyword} : title -> {title} : 标签数 -> {tag_count} : {url} ")
-            return TYPE_DEFINE["4"]["type"]
-    #异常系统判断
-    if tag_count > TAG_THRESHOLD:
+        #异常系统 命中关键词 and 结构复杂
         for keyword in KEYWORDS["ui_error"]:
             if keyword in html_lower:
                 logging.info(f"命中关键词 -> {keyword} : 标签数 -> {tag_count} : {url} ")
                 return TYPE_DEFINE["6"]["type"]
+    else:
+        #白页 结构简单 and 可见文本为空
+        if not visible_text.strip() :
+            logging.info(f"可见文本为空 ; 标签数 -> {tag_count} : {url}")
+            return TYPE_DEFINE["5"]["type"]
+        #错误页 命中关键词 and 结构简单
+        for keyword in KEYWORDS["error"]:
+            if keyword in html_lower:
+                logging.info(f"命中关键词 -> {keyword} : 标签数 -> {tag_count} : {url} ")
+                return TYPE_DEFINE["3"]["type"]
+    #欢迎页 命中关键词 and 结构简单 and title包含关键词welcom
+    for keyword in KEYWORDS["welcome"]:
+        if keyword in html_lower and "welcom" in title.lower():
+            logging.info(f"命中关键词 -> {keyword} : title -> {title} : 标签数 -> {tag_count} : {url} ")
+            return TYPE_DEFINE["4"]["type"]
+    
     #默认正常系统
     return TYPE_DEFINE["1"]["type"]
 
 
-SCREENSHOTS_DIR = ".\\screeshots\\"
+SCREENSHOTS_DIR = ".\\screenshots\\"
 
 def resize_image(image_bytes, target_height=TARGET_IMG_HIGHT,idx = None):
     img = PILImage.open(io.BytesIO(image_bytes))
@@ -187,15 +196,13 @@ def normalize_url(url: str):
 
 
 def get_status_code(driver):
-    STATIC_SUFFIXES = (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".otf")
     try:
         norm_current = normalize_url(driver.current_url)
         for request in reversed(driver.requests):
             if request.response :
                 norm_request = normalize_url(request.url)
                 if  norm_request  == norm_current:
-                    if not request.url.lower().split("?")[0].endswith(STATIC_SUFFIXES) :
-                        logging.info(f"获取 HTTP 响应码: {request.response.status_code}:{ request.url}")
+                    logging.info(f"获取 HTTP 响应码: {request.response.status_code}:{ request.url}")
                     return request.response.status_code
     except Exception as e:
         logging.exception(f"获取 HTTP 响应码失败: {str(e)}:{ request.url}")
@@ -212,12 +219,14 @@ def worker(thread_id, task_queue, result_dict, lock, llm_token, progress_callbac
             break
 
         idx, url = task
+        title = ""
+        html = ""
+        image = None
         try:
             status_dict["current"] = f"线程-{thread_id} 正在处理: {idx} - {url}"
             driver.get(url)
             time.sleep(2)
             html = driver.page_source
-            title = ""
             soup = BeautifulSoup(html, 'html.parser')
             if soup.title and soup.title.string:
                 title = soup.title.string.strip()
@@ -281,7 +290,7 @@ def write_excel(results: list, output_path):
     print(f"\n✅ Excel 文件已保存: {output_path}")
 
 # === 自动计算线程数 ===
-def calculate_worker_count(url_count, max_limit=10):
+def calculate_worker_count(url_count, max_limit=THREAD_MAX_LIMIT):
     if url_count <= 10:
         return min(2, url_count)
     elif url_count <= 100:
@@ -299,6 +308,7 @@ def main():
     parser.add_argument('-o', '--output', default='url_results', help='定义输出文件名，不加后缀')
     parser.add_argument('--llm-token', help='开启AI支持,配置token')
     parser.add_argument('--friend-ui', action='store_true', help='是否启用进度条展示(默认关闭)')
+    parser.add_argument('--clear', action='store_true', help='程序结束后删除所有本地截图(默认保留)')
     args = parser.parse_args()
 
     input_file = args.input
@@ -306,6 +316,11 @@ def main():
     llm_token = args.llm_token
     use_progress_bar = args.friend_ui
 
+    gecko_path = os.environ.get('geckodriver_exe')
+    if not gecko_path or not os.path.exists(gecko_path):
+        print(f"❌ 环境变量 'geckodriver_exe' 未设置或路径无效: {gecko_path}")
+        return
+    
     if not os.path.exists(input_file):
         print(f"❌ 未找到输入文件：{input_file}")
         return
@@ -376,6 +391,19 @@ def main():
     end_time = time.time()
     duration = end_time - start_time
     print(f"\n⏱️ 处理完毕，总耗时：{duration:.2f} 秒（约 {duration / 60:.2f} 分钟）")
+    if args.clear:
+        screenshot_dir = os.path.abspath(SCREENSHOTS_DIR)
+        deleted_count = 0
+        for file in os.listdir(screenshot_dir):
+            if file.startswith(f"{PROJ_INDEX}_") and file.endswith(".png"):
+                try:
+                    os.remove(os.path.join(screenshot_dir, file))
+                    deleted_count += 1
+                except Exception as e:
+                    logging.warning(f"无法删除截图 {file}: {e}")
+        print(f"\n🧹 已删除截图文件数量：{deleted_count}")
+    else:
+        print(f"\n📂 截图文件已保存在：{os.path.abspath(SCREENSHOTS_DIR)}")
     if llm_token_check:
         getTokenDeal()
 
