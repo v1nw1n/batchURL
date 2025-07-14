@@ -2,18 +2,13 @@ import os
 import dashscope
 import math
 from PIL import Image
-
+from constants import *
 
 MODEL = 'qwen-vl-max-latest'
 #MODEL = 'qvq-max' # 准确 更贵 速度慢
-PROMPT_PAGE_JUDGE = """
+PROMPT_PAGE_JUDGE = f"""
 图片为浏览器访问站点的页面结果,通过页面特征判断类型; 
-类型定义: 
-1正常系统:UI表现有一般WEB网站的基本结构,页面上无明显的错误提示。如门户等; 
-2登录页:在正常系统定义上,页面主要结构为登录表单; 
-3错误页:a只有及其简单的网站结构,缺乏正常主体内容,如UI或内容不完整的网站页面;b有信息提示了系统的错误状态;c有信息提示了HTTP响应码信息,如中间件提示的403页面等;(满足abc任意条件)
-4欢迎页:各种web服务器、中间件的欢迎页面。
-5白页:图中必须无任何内容/结构，表现单一色彩,。 
+{' '.join(str(v) for v in TYPE_DEFINE.values())}
 仅回复类型序号
 """
 
@@ -44,12 +39,12 @@ def agent_call(token,**msg):
         messages=messages
         )
 
-# dashscope.MultiModalConversation.call(
-#         api_key=token,
-#         model=MODEL, # 此处以qwen-vl-max为例,可按需更换模型名称。模型列表:https://help.aliyun.com/zh/model-studio/getting-started/models
-#         messages=messages,
-#         stream=True
-#         )
+    # return dashscope.MultiModalConversation.call(
+    #         api_key=token,
+    #         model=MODEL, # 此处以qwen-vl-max为例,可按需更换模型名称。模型列表:https://help.aliyun.com/zh/model-studio/getting-started/models
+    #         messages=messages,
+    #         stream=True
+    #         )
 
 
 def agent_call_stream(response):
@@ -83,12 +78,20 @@ def agent_call_stream(response):
                 answer_content += chunk.output.choices[0].message.content[0]["text"]
     return answer_content
 
+output_tokens = 0
+input_tokens = 0
 
 def getAIResponse(response:dict) -> str:
     try:
+        output_tokens +=  response["usage"]["output_tokens"] 
+        input_tokens += response["usage"]["input_tokens"]
         return response["output"]["choices"][0]["message"].content[0]["text"]
     except (KeyError, IndexError, AttributeError, TypeError):
         return response
+    
+
+def getTokenDeal():
+    print(f"💰本次消费Token:{output_tokens + input_tokens},非准确计费:{output_tokens * 0.009 + input_tokens * 0.003}")
 
 
 def is_token_valid(token: str) -> bool:
@@ -107,13 +110,10 @@ def is_token_valid(token: str) -> bool:
         )
     if response["code"] == "InvalidApiKey":
         return False
-    if response["output"]["choices"][0]["message"].content[0]["text"] == "1":
+    if getAIResponse(response) == "1":
         return True
     return False
 
-
-def getToken():
-    return os.environ.get('DASHSCOPE_API_KEY')
 
 def imgTokenSimplizer(imgPath,compression_ratio = 0):
     """
@@ -181,6 +181,11 @@ def token_calculate(imgPath):
     token = int((h_bar * w_bar) / (28 * 28))
     total_token = token + 2 
     return total_token
+
+
+def getToken():
+    return os.environ.get('DASHSCOPE_API_KEY')
+
 
 if __name__ == "__main__":
   
