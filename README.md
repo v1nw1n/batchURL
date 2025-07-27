@@ -1,13 +1,18 @@
 # 背景
-快速筛选有效资产，批量测试目标资产的访问状态。
+互联网资产众测场景下，需要快速筛选资产状态和信息以选择优先测试的目标。
 
 # 使用
+#### 系统环境
+- windows 
+- python3
 #### 下载webdriver
 https://github.com/mozilla/geckodriver/releases
 
 ```bash
 #配置环境变量
 setx geckodriver_exe /path/to/geckodriver.exe
+setx DASHSCOPE_API_KEY your_token
+setx WXWORK_ROBOT_KEY_TEST your_token
 #创建虚拟环境
 python -m venv venv
 #激活虚拟环境
@@ -29,5 +34,6 @@ python webTargetFilter.py
 
 # TODO
 
-- [ ] 简单的信息收集工作(访问资产-》对IP/域名执行正反查询；扫描静态文件，发现潜在的信息泄露)
-- [ ] 简单的漏洞扫描(访问资产-》指纹匹配-》调用对应的poc完成扫描)
+- [X] 简单的信息收集工作（访问资产-》对IP/域名执行正反查询）
+- [ ] 扫描静态文件，发现潜在的信息泄露
+- [ ] 简单的漏洞扫描（访问资产-》指纹匹配-》调用对应的poc完成扫描）

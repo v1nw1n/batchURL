@@ -8,10 +8,15 @@ import threading
 import logging
 from queue import Queue
 from datetime import datetime
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit ,urlparse
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from PIL import Image as PILImage, ImageOps
+import socket
+import dns.resolver
+import requests
+from requests.exceptions import RequestException, ProxyError, ConnectTimeout
+from selenium.webdriver.support.ui import WebDriverWait
 #===日志配置===
 LOG_FILENAME = "./log/batchURL.log"
 with open(LOG_FILENAME, "w", encoding="utf-8") as f:
@@ -48,8 +53,11 @@ from selenium.webdriver.firefox.service import Service
 from seleniumwire import webdriver  
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
 from selenium.common.exceptions import WebDriverException, TimeoutException
+from domainE import extract_main_domain
+from WXWorkWebHook import taskFinishNotify
+from NetIOHelper import NetIOHelper
 # === 配置 ===
-THREAD_MAX_LIMIT = 20
+THREAD_MAX_LIMIT = 29
 TARGET_IMG_HIGHT = 200
 ROW_HEIGHT = 150
 PROJ_INDEX = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -59,11 +67,21 @@ def print_banner():
     print(base64.b64decode(banner.encode('utf-8')).decode('utf-8'))
 
 
-# class ArgumentParserBanner(argparse.ArgumentParser):
-#     def print_help(self, *args, **kwargs):
-#         print_banner()
-#         super().print_help(*args, **kwargs)
+# 页面类型判断
+def extract_visible_text_and_count(html):
+    soup = BeautifulSoup(html, 'html.parser')
+    #记录标签总数（原始 HTML）
+    tag_count = len(soup.find_all(True))
+    #删除特定标签
+    for tag in soup(['script', 'style', 'head', 'meta', 'noscript']):
+        tag.decompose()
+    #删除 HTML 注释
+    for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+        comment.extract()
+    #提取可见文本（清理后）
+    visible_text = soup.get_text(separator=' ', strip=True)
 
+    return str(soup).lower(), visible_text.lower(), tag_count
 
 
 def page_judge(url: str, html: str,title: str ,http_status: int, imgPath: str, token: str = None) -> str:
@@ -89,21 +107,6 @@ def page_judge_ai(imgPath,token):
     return None
 
 
-def extract_visible_text_and_count(html):
-    soup = BeautifulSoup(html, 'html.parser')
-    #记录标签总数（原始 HTML）
-    tag_count = len(soup.find_all(True))
-    #删除特定标签
-    for tag in soup(['script', 'style', 'head', 'meta', 'noscript']):
-        tag.decompose()
-    #删除 HTML 注释
-    for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
-        comment.extract()
-    #提取可见文本（清理后）
-    visible_text = soup.get_text(separator=' ', strip=True)
-
-    return str(soup).lower(), visible_text.lower(), tag_count
-
 def page_judge_local(url: str, html: str,title: str ,http_status: int) -> str:
     html_lower, visible_text, tag_count = extract_visible_text_and_count(html)
     TAG_THRESHOLD = 30
@@ -123,8 +126,6 @@ def page_judge_local(url: str, html: str,title: str ,http_status: int) -> str:
         "login": ["login","type=\"password\"","登录"],
         "ui_error": ["error"]
     }
-
-
     #错误页 http status 4xx 5xx
     if http_status is not None and http_status >= 400:
         logging.info(f"http status code -> {http_status} : {url}")
@@ -177,18 +178,114 @@ def resize_image(image_bytes, target_height=TARGET_IMG_HIGHT,idx = None):
     buffer.seek(0)
     return buffer
 
-# === 创建浏览器实例 ===
-def create_browser():
-    options = FirefoxOptions()
-    options.add_argument("--headless")
-    options.accept_insecure_certs = True
-    options.binary_location = "C:\\Program Files\\Mozilla Firefox\\firefox.exe"
-    service = Service(os.environ.get('geckodriver_exe'))
-    driver = webdriver.Firefox( seleniumwire_options={'disable_capture': False}, options=options,service=service )
-    driver.set_page_load_timeout(15)
-    return driver
 
-# === 获取状态码 ===
+image_save_queue = Queue()
+
+def image_saver_worker():
+    while True:
+        item = image_save_queue.get()
+        if item is None:
+            break
+        idx, image_bytes = item
+        try:
+            img = PILImage.open(io.BytesIO(image_bytes))
+            os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+            img.save(os.path.join(SCREENSHOTS_DIR, f"{PROJ_INDEX}_{idx}.png"), format="PNG", optimize=True)
+        except Exception as e:
+            logging.warning(f"截图保存失败 idx={idx}: {e}")
+        image_save_queue.task_done()
+
+
+def cleanup_screenshots():
+    screenshot_dir = os.path.abspath(SCREENSHOTS_DIR)
+    deleted_count = 0
+    for file in os.listdir(screenshot_dir):
+        if file.startswith(f"{PROJ_INDEX}_") and file.endswith(".png"):
+            try:
+                os.remove(os.path.join(screenshot_dir, file))
+                deleted_count += 1
+            except Exception as e:
+                logging.warning(f"无法删除截图 {file}: {e}")
+    print(f"\n🧹  已删除截图文件数量：{deleted_count}")
+
+
+def net_check(target_url, proxy_address, timeout=5):
+    result = {
+        "target": target_url,
+        "proxy_status": None,
+        "direct_status": None,
+        "proxy_code": None,
+        "direct_code": None,
+        "result": None
+    }
+    proxies = {
+        "http": proxy_address,
+        "https": proxy_address
+    }
+    # 直连访问
+    try:
+        direct_resp = requests.get(target_url, timeout=timeout)
+        result["direct_status"] = True
+        result["direct_code"] = direct_resp.status_code
+    except RequestException:
+        result["direct_status"] = False
+
+    # 代理访问
+    try:
+        proxy_resp = requests.get(target_url, proxies=proxies, timeout=timeout)
+        result["proxy_status"] = True
+        result["proxy_code"] = proxy_resp.status_code
+    except (ProxyError, ConnectTimeout, RequestException):
+        result["proxy_status"] = False
+    # 逻辑判断
+    ps = result["proxy_status"]
+    ds = result["direct_status"]
+    pc = result["proxy_code"]
+    dc = result["direct_code"]
+
+    if ps and ds:
+        if pc == dc:
+            result["result"] = "任意网络"
+        elif pc in [403, 405, 502] and dc < 400:
+            result["result"] = "直连访问"
+        else:
+            result["result"] = "直连访问【需确认】"
+    elif ps and not ds:
+        result["result"] = "代理访问"
+    elif not ps and ds:
+        result["result"] = "直连访问"
+    else:
+        result["result"] = "不可访问"
+    logging.info(f"proxy_status->{result['proxy_status']}:direct_status->{result['direct_status']}:proxy_code->{result['proxy_code']}:direct_code->{result['direct_code']}:{target_url}")
+    return result["result"]
+
+def resolve_ip(url, custom_dns=None):
+    domain = urlparse(url).hostname
+    try:
+        if custom_dns:
+            resolver = dns.resolver.Resolver()
+            resolver.nameservers = [custom_dns]
+            answer = resolver.resolve(domain)
+            logger.info(f"dns->{custom_dns}:ip->{ip}:{url}")
+            return answer[0].to_text()
+        else:
+            ip = socket.gethostbyname(domain)
+            logger.info(f"dns->default:ip->{ip}:{url}")
+            return ip
+    except:
+        if custom_dns:
+            try:
+                ip = socket.gethostbyname(domain)
+                logger.info(f"dns->default:ip->{ip}:{url}")
+                return ip
+            except:
+                logger.info(f"dns->default:ip->无法解析:{url}")
+                return ""
+        logger.info(f"dns->default:ip->无法解析:{url}")
+        return ""
+
+
+# 获取状态码 
 def normalize_url(url: str):
     parts = urlsplit(url)
     # 丢弃 fragment
@@ -209,9 +306,30 @@ def get_status_code(driver):
         pass
     return -1
 
-# === 浏览器池工作线程 ===
-def worker(thread_id, task_queue, result_dict, lock, llm_token, progress_callback, status_dict):
+
+# 创建浏览器实例 
+def create_browser():
+    options = FirefoxOptions()
+    options.add_argument("--headless")
+    #禁用HTTP2
+    options.set_preference("network.http.spdy.enabled", False)
+    options.set_preference("network.http.spdy.enabled.http2", False)
+    options.set_preference("network.http.spdy.enabled.deps", False)
+    options.set_preference("network.http.spdy.websockets", False)
+    options.set_preference("network.http.http2.enabled", False)
+    #======
+    options.accept_insecure_certs = True
+    options.binary_location = "C:\\Program Files\\Mozilla Firefox\\firefox.exe"
+    service = Service(os.environ.get('geckodriver_exe'))
+    driver = webdriver.Firefox( seleniumwire_options={'disable_capture': False}, options=options,service=service )
+    driver.set_page_load_timeout(15)
+    return driver
+
+
+#  浏览器池工作线程 
+def worker(thread_id, task_queue, result_dict, lock, llm_token, progress_callback, status_dict ,ns_dns, proxy_url):
     driver = create_browser()
+    net_helper = NetIOHelper(proxy_url=proxy_url, custom_dns=ns_dns)
     while True:
         try:
             task = task_queue.get(timeout=3)
@@ -219,23 +337,38 @@ def worker(thread_id, task_queue, result_dict, lock, llm_token, progress_callbac
             break
 
         idx, url = task
+        status_dict["current"] = f"线程-{thread_id} 正在处理: {idx} - {url}"
+
         title = ""
         html = ""
         image = None
+        topDoamin =  extract_main_domain(url)
+
         try:
-            status_dict["current"] = f"线程-{thread_id} 正在处理: {idx} - {url}"
+            ip = net_helper.resolve_ip(url)
+            proxy_reachable = net_helper.net_check(url)
+            # proxy_reachable = net_check(url,proxy_url)
+            # ip = resolve_ip(url,ns_dns)
+        except Exception as e:
+            logging.exception(f"处理 {url} 异常:{e} ")
+
+        try:
             driver.get(url)
-            time.sleep(2)
+            WebDriverWait(driver, 6).until(
+                lambda d: d.execute_script('return document.readyState') == 'complete'
+            )
             html = driver.page_source
             soup = BeautifulSoup(html, 'html.parser')
             if soup.title and soup.title.string:
                 title = soup.title.string.strip()
             http_status = get_status_code(driver)
             screenshot = driver.get_screenshot_as_png()
+            image_save_queue.put((idx, screenshot))
             image = resize_image(image_bytes = screenshot,idx = idx)
             imgPath = os.path.join( os.path.abspath(SCREENSHOTS_DIR), f"{PROJ_INDEX}_{idx}.png")
             logging.info(f"imgPath->{imgPath}:{url}")
             status = page_judge(url=url, html = html,title = title, http_status = http_status, imgPath = imgPath, token = llm_token)
+            
         except TimeoutException:
             status = "无法访问(访问超时)"
             image = None
@@ -253,100 +386,139 @@ def worker(thread_id, task_queue, result_dict, lock, llm_token, progress_callbac
                 "url": url,
                 "status": status,
                 "page_title": title,
+                "IP": ip,
+                "topDomain": topDoamin,
+                "proxy_reachable": proxy_reachable,
                 "image": image
             }
             if progress_callback:
                 progress_callback()
 
         task_queue.task_done()
-
+    net_helper.close()
     driver.quit()
 
-# === 写入 Excel 文件 ===
+# 写入 Excel 文件
 def write_excel(results: list, output_path):
     wb = Workbook()
-    ws = wb.active
-    ws.title = "访问结果"
-    ws.append(["ID", "URL", "访问状态", "标题", "截图"])
-    for row_num, res in enumerate(results, start=2):
-        ws.cell(row=row_num, column=1, value=res["id"])
-        ws.cell(row=row_num, column=2, value=res["url"])
-        ws.cell(row=row_num, column=3, value=res["status"])
-        ws.cell(row=row_num, column=4, value=res.get("page_title", ""))
-        if res["image"]:
-            img = XLImage(res["image"])
-            ws.add_image(img, f"E{row_num}") #E 插入图片的列
+    ws_ok = wb.active
+    ws_ok.title = "优选目标"
+    ws_error = wb.create_sheet(title="错误页")
+    ws_failed = wb.create_sheet(title="无法访问")
+
+    headers = ["ID", "URL", "访问状态", "标题", "域名解析IP", "主域名", "网络访问", "截图"]
+
+    for ws in [ws_ok, ws_error, ws_failed]:
+        ws.append(headers)
+        ws.column_dimensions["A"].width = 5
+        ws.column_dimensions["B"].width = 30
+        ws.column_dimensions["C"].width = 18
+        ws.column_dimensions["D"].width = 25
+        ws.column_dimensions["E"].width = 15
+        ws.column_dimensions["F"].width = 20
+        ws.column_dimensions["G"].width = 10
+        ws.column_dimensions["H"].width = 50
+
+    for res in results:
+        row_data = [
+            res["id"],
+            res["url"],
+            res["status"],
+            res.get("page_title", ""),
+            res.get("IP", ""),
+            res.get("topDomain", ""),
+            res.get("proxy_reachable", "")
+        ]
+        image = res.get("image")
+        status = res.get("status", "")
+
+        # 判断目标写入哪个 sheet
+        if status.startswith("无法访问"):
+            ws = ws_failed
+        elif "错误" in status:
+            ws = ws_error
+        else:
+            ws = ws_ok
+
+        row_num = ws.max_row + 1
+        for col_num, value in enumerate(row_data, start=1):
+            ws.cell(row=row_num, column=col_num, value=value)
+        if image:
+            img = XLImage(image)
+            ws.add_image(img, f"H{row_num}")
             ws.row_dimensions[row_num].height = ROW_HEIGHT
         else:
-            ws.cell(row=row_num, column=5, value="（无截图）")
+            ws.cell(row=row_num, column=8, value="")
             ws.row_dimensions[row_num].height = 20
-
-    ws.column_dimensions["A"].width = 6
-    ws.column_dimensions["B"].width = 50
-    ws.column_dimensions["C"].width = 20
-    ws.column_dimensions["D"].width = 30
-    ws.column_dimensions["E"].width = 45
+    
     wb.save(output_path)
-    print(f"\n✅ Excel 文件已保存: {output_path}")
+    print(f"\n✅  Excel 文件已保存: {output_path}")
+    return output_path
 
-# === 自动计算线程数 ===
+
+# 自动计算线程数
 def calculate_worker_count(url_count, max_limit=THREAD_MAX_LIMIT):
     if url_count <= 10:
         return min(2, url_count)
-    elif url_count <= 100:
-        return min(4, url_count)
-    elif url_count <= 300:
-        return min(6, url_count)
+    elif url_count <= 250:
+        return min(10, url_count)
+    elif url_count <= 400:
+        return min(20, url_count)
     else:
         return min(max_limit, url_count // 20 + 2)
 
-
+output_excel = ""
 def main():
     print_banner()
-    parser = argparse.ArgumentParser(description="批量获取目标URL访问状态")
-    parser.add_argument('-i', '--input', default='urls', help='定义目标,一行一个目标(txt)')
-    parser.add_argument('-o', '--output', default='url_results', help='定义输出文件名，不加后缀')
-    parser.add_argument('--llm-token', help='开启AI支持,配置token')
-    parser.add_argument('--friend-ui', action='store_true', help='是否启用进度条展示(默认关闭)')
-    parser.add_argument('--clear', action='store_true', help='程序结束后删除所有本地截图(默认保留)')
+    parser = argparse.ArgumentParser(description="从URLs获取更多信息")
+    parser.add_argument('-i', '--input', metavar = "file",default='url-prod.txt', help='定义目标,一行一个目标(txt)')
+    parser.add_argument('-o', '--output', metavar = "file name",default=f'batchURL_{PROJ_INDEX}.xlsx', help='定义输出文件名，不加后缀')
+    parser.add_argument('-t','--llm-token',metavar="token", help='开启AI支持,配置token')
+    parser.add_argument('-u','--friend-ui', action='store_true', help='是否启用进度条展示(默认关闭)')
+    parser.add_argument('-c','--clean-img', action='store_true', help='程序结束后删除所有本地截图(默认保留)')
+    parser.add_argument('-p','--net-check',metavar = "proxy",help='配置一个无害的代理,检查目标的网络可达性,仅支持http(s)')
+    parser.add_argument('-n','--ns',metavar = "DNS address" ,help='指定用于解析URL对应域名的 DNS 服务器,默认使用系统NS')
+    parser.add_argument('-r','--push-res',action='store_true' ,help='是否推送任务完成通知到企业微信机器人(默认关闭)')
+
     args = parser.parse_args()
+
 
     input_file = args.input
     output_excel = f"{args.output}_{PROJ_INDEX}.xlsx"
     llm_token = args.llm_token
     use_progress_bar = args.friend_ui
+    is_clean_img = args.clean_img
+
 
     gecko_path = os.environ.get('geckodriver_exe')
     if not gecko_path or not os.path.exists(gecko_path):
-        print(f"❌ 环境变量 'geckodriver_exe' 未设置或路径无效: {gecko_path}")
+        print(f"❌  环境变量 'geckodriver_exe' 未设置或路径无效: {gecko_path}")
         return
     
     if not os.path.exists(input_file):
-        print(f"❌ 未找到输入文件：{input_file}")
+        print(f"❌  未找到输入文件：{input_file}")
         return
 
     with open(input_file, 'r', encoding='utf-8') as f:
-        urls = [line.strip() for line in f if line.strip()]
-
+        urls = [line.strip().strip('\'"') for line in f if line.strip()]
     url_count = len(urls)
     if url_count == 0:
-        print("❗ 输入 URL 为空")
+        print("❌  输入 URL 为空")
         return
+
     llm_token_check = False
     if llm_token is not None:
         if is_token_valid(llm_token):
             output_excel = f"{args.output}_{PROJ_INDEX}_AI.xlsx"
             llm_token_check = True
-            print("✅LLM TOKEN已配置")
+            print("✅  LLM TOKEN已配置")
         else :
             llm_token = None
-            print("❌LLM TOKEN不可用")
+            print("⚠️  LLM TOKEN不可用")
         
-
     worker_count = calculate_worker_count(url_count)
-    print(f"📊 总计 URL: {url_count}，浏览器池线程数: {worker_count}")
+    print(f"📊  总计 URL: {url_count}，浏览器池线程数: {worker_count}")
 
-    start_time = time.time()
 
     task_queue = Queue()
     for idx, url in enumerate(urls, start=1):
@@ -356,15 +528,15 @@ def main():
     lock = threading.Lock()
     threads = []
     status_dict = {"current": ""}
-
+    #进度信息
     progress_count = [0]
     progress_bar = None
     if use_progress_bar:
         try:
             from tqdm import tqdm
-            progress_bar = tqdm(total=url_count, desc="处理进度", ncols=80)
+            progress_bar = tqdm(total=url_count, desc="⏸️  处理进度", ncols=80)
         except ImportError:
-            print("⚠️ 未安装 tqdm,进度条自动切换为轻量模式")
+            print("⚠️  未安装 tqdm,进度条自动切换为轻量模式")
             use_progress_bar = False
 
     def progress_callback():
@@ -374,38 +546,37 @@ def main():
         else:
             print(f"\r⏸️  进度: {progress_count[0]}/{url_count}", end="")
 
+    start_time = time.time()
     for i in range(worker_count):
-        t = threading.Thread(target=worker, args=(i + 1, task_queue, results_dict, lock, llm_token, progress_callback, status_dict))
+        t = threading.Thread(target=worker, args=(i + 1, task_queue, results_dict, lock, llm_token, progress_callback, status_dict, args.ns, args.net_check))
         t.start()
         threads.append(t)
-
+    image_thread = threading.Thread(target=image_saver_worker)
+    image_thread.start()
     for t in threads:
         t.join()
+    image_save_queue.put(None)
+    image_thread.join()
 
     if progress_bar:
         progress_bar.close()
+    end_time = time.time()
 
     results = [results_dict[i] for i in sorted(results_dict.keys())]
-    write_excel(results, output_excel)
-
-    end_time = time.time()
-    duration = end_time - start_time
-    print(f"\n⏱️ 处理完毕，总耗时：{duration:.2f} 秒（约 {duration / 60:.2f} 分钟）")
-    if args.clear:
-        screenshot_dir = os.path.abspath(SCREENSHOTS_DIR)
-        deleted_count = 0
-        for file in os.listdir(screenshot_dir):
-            if file.startswith(f"{PROJ_INDEX}_") and file.endswith(".png"):
-                try:
-                    os.remove(os.path.join(screenshot_dir, file))
-                    deleted_count += 1
-                except Exception as e:
-                    logging.warning(f"无法删除截图 {file}: {e}")
-        print(f"\n🧹 已删除截图文件数量：{deleted_count}")
+    fileP = write_excel(results, output_excel)
+    
+    if not use_progress_bar:
+        duration = end_time - start_time
+        print(f"\n⏱️  处理完毕，总耗时：{duration:.2f} 秒（约 {duration / 60:.2f} 分钟）")
+    if is_clean_img:
+        cleanup_screenshots()
     else:
-        print(f"\n📂 截图文件已保存在：{os.path.abspath(SCREENSHOTS_DIR)}")
+        print(f"\n📂  截图文件已保存在：{os.path.abspath(SCREENSHOTS_DIR)}")
     if llm_token_check:
         getTokenDeal()
+    #任务完成推送消息
+    if args.push_res:
+        taskFinishNotify(args.output, fileP, "1")
 
 if __name__ == "__main__":
     main()

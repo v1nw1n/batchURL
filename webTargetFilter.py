@@ -1,3 +1,4 @@
+# 用于通过ip:port检查目标是否是web服务
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib3

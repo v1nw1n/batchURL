@@ -91,7 +91,7 @@ def getAIResponse(response:dict) -> str:
     
 
 def getTokenDeal():
-    print(f"💰本次消费Token:{output_tokens + input_tokens},非准确计费:{output_tokens * 0.009 + input_tokens * 0.003}")
+    print(f"💰  本次消费Token:{output_tokens + input_tokens},非准确计费:{output_tokens * 0.009 + input_tokens * 0.003}")
 
 
 def is_token_valid(token: str) -> bool:
