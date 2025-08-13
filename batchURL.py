@@ -18,6 +18,7 @@ import requests
 from requests.exceptions import RequestException, ProxyError, ConnectTimeout
 from selenium.webdriver.support.ui import WebDriverWait
 #===日志配置===
+os.makedirs(os.path.join(os.getcwd(), 'log'), exist_ok=True)
 LOG_FILENAME = "./log/batchURL.log"
 with open(LOG_FILENAME, "w", encoding="utf-8") as f:
     f.write('')
@@ -61,6 +62,9 @@ THREAD_MAX_LIMIT = 29
 TARGET_IMG_HIGHT = 200
 ROW_HEIGHT = 150
 PROJ_INDEX = datetime.now().strftime("%Y%m%d%H%M%S")
+normal_count = 0
+abnormal_count = 0
+unreachable_count = 0
 
 def print_banner():
     banner = "Cl9fX19fXyAgICAgICBfICAgICAgIF8gICAgIF8gICBfX19fX19fIF8gICAgIAp8IF9fXyBcICAgICB8IHwgICAgIHwgfCAgIHwgfCB8IHwgX19fIHwgfCAgICAKfCB8Xy8gLyBfXyBffCB8XyBfX198IHxfXyB8IHwgfCB8IHxfLyB8IHwgICAgCnwgX19fIFwvIF9gIHwgX18vIF9ffCAnXyBcfCB8IHwgfCAgICAvfCB8ICAgIAp8IHxfLyB8IChffCB8IHx8IChfX3wgfCB8IHwgfF98IHwgfFwgXHwgfF9fX18KXF9fX18vIFxfXyxffFxfX1xfX198X3wgfF98XF9fXy9cX3wgXF9cX19fX18vCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgLS1ieSB2MW53MW4gICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAo="
@@ -307,6 +311,27 @@ def get_status_code(driver):
     return -1
 
 
+def get_firefox_exe_dir():
+    return "C:\\Program Files\\Mozilla Firefox\\firefox.exe"
+
+    for path in os.environ.get('PATH', '').split(os.pathsep):
+        exe_path = os.path.join(path, 'firefox.exe')
+        if os.path.isfile(exe_path):
+            return exe_path
+    common_paths = [
+        r"C:\Program Files\Mozilla Firefox\firefox.exe",
+        r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Mozilla Firefox\firefox.exe"),
+        os.path.expandvars(r"%PROGRAMFILES%\Mozilla Firefox\firefox.exe"),
+        os.path.expandvars(r"%PROGRAMFILES(x86)%\Mozilla Firefox\firefox.exe"),
+    ]
+    for p in common_paths:
+        if os.path.isfile(p):
+            return p
+    return "C:\\Program Files\\Mozilla Firefox\\firefox.exe"
+
+
+
 # 创建浏览器实例 
 def create_browser():
     options = FirefoxOptions()
@@ -319,7 +344,7 @@ def create_browser():
     options.set_preference("network.http.http2.enabled", False)
     #======
     options.accept_insecure_certs = True
-    options.binary_location = "C:\\Program Files\\Mozilla Firefox\\firefox.exe"
+    options.binary_location = get_firefox_exe_dir()
     service = Service(os.environ.get('geckodriver_exe'))
     driver = webdriver.Firefox( seleniumwire_options={'disable_capture': False}, options=options,service=service )
     driver.set_page_load_timeout(15)
@@ -398,8 +423,11 @@ def worker(thread_id, task_queue, result_dict, lock, llm_token, progress_callbac
     net_helper.close()
     driver.quit()
 
+
+
 # 写入 Excel 文件
 def write_excel(results: list, output_path):
+    global normal_count, abnormal_count, unreachable_count 
     wb = Workbook()
     ws_ok = wb.active
     ws_ok.title = "优选目标"
@@ -418,7 +446,7 @@ def write_excel(results: list, output_path):
         ws.column_dimensions["F"].width = 20
         ws.column_dimensions["G"].width = 10
         ws.column_dimensions["H"].width = 50
-
+    
     for res in results:
         row_data = [
             res["id"],
@@ -435,10 +463,13 @@ def write_excel(results: list, output_path):
         # 判断目标写入哪个 sheet
         if status.startswith("无法访问"):
             ws = ws_failed
+            unreachable_count += 1
         elif "错误" in status:
             ws = ws_error
+            abnormal_count += 1
         else:
             ws = ws_ok
+            normal_count += 1
 
         row_num = ws.max_row + 1
         for col_num, value in enumerate(row_data, start=1):
@@ -470,8 +501,8 @@ def calculate_worker_count(url_count, max_limit=THREAD_MAX_LIMIT):
 output_excel = ""
 def main():
     print_banner()
-    parser = argparse.ArgumentParser(description="从URLs获取更多信息")
-    parser.add_argument('-i', '--input', metavar = "file",default='url-prod.txt', help='定义目标,一行一个目标(txt)')
+    parser = argparse.ArgumentParser(description="从URLs获取更多访问信息")
+    parser.add_argument('-i', '--input', metavar = "file",default='url-prod.txt', help='定义目标(需要http(s)前缀),一行一个目标(txt)')
     parser.add_argument('-o', '--output', metavar = "file name",default=f'batchURL_{PROJ_INDEX}.xlsx', help='定义输出文件名，不加后缀')
     parser.add_argument('-t','--llm-token',metavar="token", help='开启AI支持,配置token')
     parser.add_argument('-u','--friend-ui', action='store_true', help='是否启用进度条展示(默认关闭)')
@@ -576,7 +607,9 @@ def main():
         getTokenDeal()
     #任务完成推送消息
     if args.push_res:
-        taskFinishNotify(args.output, fileP, "1")
+        taskFinishNotify({"projectName": args.output,"normal_count":normal_count,"abnormal_count":abnormal_count,"unreachable_count":unreachable_count}, fileP, "1")
 
 if __name__ == "__main__":
     main()
+
+#TODO: 程序异常/崩溃/用户终止时：删除已产生的文件，清理遗留的进程（崩溃进程/浏览器进程）

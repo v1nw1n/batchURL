@@ -5,6 +5,7 @@ import logging
 
 
 def getKey(type):
+   
     """
     获取企业微信机器人key
     :param type: 机器人类型
@@ -37,11 +38,20 @@ def pushMessage(msg,mentioned_mobile_list):
     data = {
         "msgtype": "text",
         "text": {
-            "content": msg,
+            "content": "",
             "mentioned_mobile_list": mentioned_mobile_list
         }
     }
-    fetch_req(url, data)
+    fetch_req(url, data=data)
+    data = {
+	"msgtype": "markdown_v2",
+	"markdown_v2": {
+         "content": f"您的扫描任务【{msg['projectName']}】已完成，统计信息如下：\n| 资产状态 | 统计 |\n| :--- | :- |\n| 正常访问 |  {msg['normal_count']}  |\n| 异常资产 |  {msg['abnormal_count']}  |\n| 无法访问 |  {msg['unreachable_count']}  |   \n\n扫描详情请查收附件👇"
+	   }
+    }
+    fetch_req(url, data=data)
+    
+
     
 
 
@@ -85,13 +95,12 @@ def upload_wechat_webhook_media( file_path: str, type: str = "file"):
 
 def getUserByCreator(creator):
     userDict = {
-        "1": [""]
+        "1": ["15588545526"]
     }
     return userDict.get(creator, [])
     
 
-def taskFinishNotify(projectName,fileP,creator):
-    msg = f"您的扫描任务【{projectName}】已完成,请查收扫描结果👇"
+def taskFinishNotify(msg:dict,fileP,creator):
     mentioned_mobile_list = getUserByCreator(creator)
     pushMessage(msg, mentioned_mobile_list)
     if fileP:
@@ -102,6 +111,5 @@ def taskFinishNotify(projectName,fileP,creator):
 
 
 if __name__ == "__main__":
-    file_path = "./xx.xlsx" 
-    taskFinishNotify("测试项目", file_path, "1")
-    
+    file_path = "./上海长宁_20250726113024.xlsx" 
+    taskFinishNotify({"projectName": "ces","normal_count":1,"abnormal_count":2,"unreachable_count":3}, file_path, "1")

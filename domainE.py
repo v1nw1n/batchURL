@@ -7,8 +7,8 @@ def extract_main_domain(url):
         if ext.domain and ext.suffix:
             return f"{ext.domain}.{ext.suffix}"
     except:
-        return ""
-    return ""
+        return None
+    return None
 
 def extract_domains_from_file(file_path):
     domains = set()
@@ -19,7 +19,7 @@ def extract_domains_from_file(file_path):
                 if not url:
                     continue
                 domain = extract_main_domain(url)
-                if domain == "":
+                if domain is not None:
                     domains.add(domain)
     except FileNotFoundError:
         print(f"[ERROR] 文件不存在: {file_path}")
@@ -30,5 +30,4 @@ if __name__ == "__main__":
     main_domains = extract_domains_from_file(input_file)
 
     print("[*] 提取的主域名：\n")
-    for d in main_domains:
-        print(d)
+    print(main_domains)
